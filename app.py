@@ -9,6 +9,7 @@ F1 Podium Predictor — Streamlit App (Dual Global clean+mixed + LightGBM + MC)
 """
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any
+import os
 import datetime as dt
 import requests
 import numpy as np
@@ -85,6 +86,7 @@ TRACK_COORDS = {
     "Silverstone": (52.0733, -1.0140),
 }
 
+os.makedirs("f1_cache", exist_ok=True)
 fastf1.Cache.enable_cache("f1_cache")
 
 @st.cache_data(show_spinner=False)
