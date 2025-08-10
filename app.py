@@ -564,41 +564,6 @@ class PodiumService:
         trB = featB[~((featB["season"] == latest_season) & (featB["round"] == latest_round))]
         _ = self._train_dual(trA, trB)
 
-
-# features for inference
-XA = infA.drop(columns=["pace_median_s", "season", "round", "circuit_id", "Driver", "race_id"], errors='ignore')
-XB = infB.drop(columns=["pace_median_s", "season", "round", "circuit_id", "Driver", "race_id"], errors='ignore')
-drivers = infA["Driver"].reset_index(drop=True)
-
-# 4) Train on everything EXCEPT the target race (prevents leakage and ghost drivers)
-trA = featA[~((featA["season"] == latest_season) & (featA["round"] == latest_round))]
-trB = featB[~((featB["season"] == latest_season) & (featB["round"] == latest_round))]
-_ = self._train_dual(trA, trB)
-
-        infA = featA[(featA["season"] == latest_season) & (featA["round"] == latest_round)]
-        infB = featB[(featB["season"] == latest_season) & (featB["round"] == latest_round)]
-        if len(infA) == 0 or len(infB) == 0:
-            raise ValueError("No inference rows for latest target race (missing Q/R data).")
-
-        XA = infA.drop(columns=["pace_median_s", "season", "round", "circuit_id", "Driver", "race_id"], errors='ignore')
-        XB = infB.drop(columns=["pace_median_s", "season", "round", "circuit_id", "Driver", "race_id"], errors='ignore')
-        drivers = infA["Driver"].reset_index(drop=True)
-
-        # 4) Train on everything EXCEPT the target race (prevents leakage and ghost drivers)
-        trA = featA[~((featA["season"] == latest_season) & (featA["round"] == latest_round))]
-        trB = featB[~((featB["season"] == latest_season) & (featB["round"] == latest_round))]
-        if len(trA) < 10 or len(trB) < 10:
-            pass  # still train; caller shows CV fallback
-        _ = self._train_dual(trA, trB)
-
-        if len(XA) == 0 or len(XB) == 0:
-            raise ValueError("No inference rows for target GP.")
-        q_blend = self.dual.predict_quantiles_blended(XA, XB)
-        base_pace = q_blend.get(0.5, self.dual.predict_blended(XA, XB))
-        sigma = self.dual.sigma_combined(drivers, q_blend)
-        ranking, _ = monte_carlo_podium(drivers, base_pace, sigma, laps, pit_loss_s, pit_count_mean, sc_rate, team_order_prob, n_runs=self.cfg.sim.n_runs, seed=self.cfg.sim.rng_seed)
-        return ranking
-
 # ========================= UI — Sidebar Controls =========================
 st.sidebar.header("Settings")
 
