@@ -506,52 +506,86 @@ class PodiumService:
 
 # ========================= UI — Sidebar Controls =========================
 st.sidebar.header("Settings")
+
+# --- GP picker (dropdown or free text) ---
+KNOWN_GPS = sorted(list(TRACK_COORDS.keys()) + [
+    "Australia", "Spain", "Canada", "Austria", "Hungary", "Belgium",
+    "Netherlands", "Singapore", "USA", "Mexico", "Brazil", "Abu Dhabi"
+])
+
+gp_mode = st.sidebar.radio("GP input mode", ["Pick from list", "Free text"], horizontal=True)
+if gp_mode == "Pick from list":
+    gp = st.sidebar.selectbox("Grand Prix", KNOWN_GPS, index=KNOWN_GPS.index("Monaco") if "Monaco" in KNOWN_GPS else 0)
+else:
+    gp = st.sidebar.text_input("GP (track key)", value="Monaco")
+
+# --- Date & Seasons ---
 col1, col2 = st.sidebar.columns(2)
 with col1:
-    gp = st.text_input("GP (track key)", value="Monaco")
-with col2:
     date = st.text_input("Date (YYYY-MM-DD)", value="2025-05-25")
-seasons_str = st.sidebar.text_input("Training seasons (comma)", value="2022,2023,2024")
-seasons_tuple = tuple(int(s.strip()) for s in seasons_str.split(",") if s.strip())
+with col2:
+    season_choices = list(range(2018, dt.date.today().year+1))
+    default_seasons = [2022, 2023, 2024]
+seasons_selected = st.sidebar.multiselect("Training seasons", options=season_choices, default=default_seasons)
+seasons_tuple = tuple(sorted(set(int(s) for s in seasons_selected)))
+if len(seasons_tuple) < 2:
+    st.sidebar.info("Tip: Add more seasons for stabler CV")
 
-st.sidebar.subheader("Race Params")
-laps = st.sidebar.number_input("Laps", min_value=1, max_value=1000, value=60)
-pit_loss_s = st.sidebar.number_input("Pit loss (s)", min_value=0.0, max_value=60.0, value=22.0, step=0.5)
-pit_count_mean = st.sidebar.number_input("Mean pit stops", min_value=0.0, max_value=6.0, value=2.0, step=0.1)
-sc_rate = st.sidebar.slider("Safety Car probability", 0.0, 1.0, 0.35, 0.01)
-team_order_prob = st.sidebar.slider("Team-order probability", 0.0, 1.0, 0.10, 0.01)
+# --- Advanced settings expander ---
+with st.sidebar.expander("Advanced settings", expanded=False):
+    st.markdown("**Race Params**")
+    laps = st.number_input("Laps", min_value=1, max_value=1000, value=60, key="laps")
+    pit_loss_s = st.number_input("Pit loss (s)", min_value=0.0, max_value=60.0, value=22.0, step=0.5, key="pitloss")
+    pit_count_mean = st.number_input("Mean pit stops", min_value=0.0, max_value=6.0, value=2.0, step=0.1, key="pitmean")
+    sc_rate = st.slider("Safety Car probability", 0.0, 1.0, 0.35, 0.01, key="sc")
+    team_order_prob = st.slider("Team-order probability", 0.0, 1.0, 0.10, 0.01, key="teamorder")
 
-st.sidebar.subheader("Model / Simulation")
-# --- Weather controls ---
-st.sidebar.subheader("Weather")
-wx_mode = st.sidebar.selectbox("Weather source", ["None", "Forecast (Open-Meteo)", "Past 3 days avg (Open-Meteo)"])
-lat_in = st.sidebar.text_input("Latitude (optional)", value="")
-lon_in = st.sidebar.text_input("Longitude (optional)", value="")
+    st.markdown("**Model / Simulation**")
+    w_mixed = st.slider("Blend weight (mixed laps)", 0.0, 1.0, 0.6, 0.05, key="wmixed")
+    n_runs = st.number_input("Monte Carlo runs", min_value=100, max_value=10000, value=1500, step=100, key="nruns")
+    rng_seed = st.number_input("Random seed", min_value=0, max_value=10_000_000, value=42, step=1, key="seed")
 
-w_mixed = st.sidebar.slider("Blend weight (mixed laps)", 0.0, 1.0, 0.6, 0.05)
-n_runs = st.sidebar.number_input("Monte Carlo runs", min_value=100, max_value=10000, value=1500, step=100)
+    st.markdown("**Weather**")
+    wx_mode = st.selectbox("Weather source", ["None", "Forecast (Open-Meteo)", "Past 3 days avg (Open-Meteo)"], key="wxmode")
+    lat_in = st.text_input("Latitude (optional)", value="", key="lat")
+    lon_in = st.text_input("Longitude (optional)", value="", key="lon")
 
-run_btn = st.sidebar.button("Predict podium", type="primary")
+# Cache tools
+colc1, colc2 = st.sidebar.columns([1,1])
+with colc1:
+    run_btn = st.button("Predict podium", type="primary")
+with colc2:
+    if st.button("Clear FastF1 cache"):
+        import shutil
+        try:
+            shutil.rmtree("f1_cache")
+            os.makedirs("f1_cache", exist_ok=True)
+            st.sidebar.success("Cache cleared")
+        except Exception as e:
+            st.sidebar.warning(f"Cache clear failed: {e}")
 
 # ========================= Run & Display =========================
 if run_btn:
-    with st.spinner("Loading FastF1 sessions and training models…"):
+    with st.status("Preparing…", expanded=False) as status:
+        status.update(label="Loading sessions", state="running")
         try:
             APP_CONFIG.sim.n_runs = int(n_runs)
+            APP_CONFIG.sim.rng_seed = int(rng_seed)
             svc = PodiumService(APP_CONFIG, w_mixed=float(w_mixed))
+
             # Weather fetch (optional)
             wx = None
-            if wx_mode != "None":
+            if st.session_state.get("wxmode", "None") != "None":
                 try:
-                    lat_val = float(lat_in) if lat_in.strip() else None
-                    lon_val = float(lon_in) if lon_in.strip() else None
+                    lat_val = float(lat_in) if str(lat_in).strip() else None
+                    lon_val = float(lon_in) if str(lon_in).strip() else None
                 except ValueError:
                     lat_val, lon_val = None, None
                 la, lo = _coalesce_coords(gp, lat_val, lon_val)
                 if la is None or lo is None:
                     st.warning("No coordinates found. Provide lat/lon or choose a known GP key.")
                 else:
-                    mode_flag = "forecast" if "Forecast" in wx_mode else "past"
+                    mode_flag = "forecast" if "Forecast" in st.session_state["wxmode"] else "past"
                     try:
                         wx = fetch_weather_open_meteo(la, lo, date, mode=mode_flag)
                     except Exception as we:
@@ -561,20 +595,22 @@ if run_btn:
             ranking = svc.predict_podium(
                 gp_track_key=gp,
                 date=date,
-                seasons_for_training=seasons_tuple,
-                laps=int(laps),
-                pit_loss_s=float(pit_loss_s),
-                pit_count_mean=float(pit_count_mean),
-                sc_rate=float(sc_rate),
-                team_order_prob=float(team_order_prob),
+                seasons_for_training=seasons_tuple if seasons_tuple else (2022, 2023, 2024),
+                laps=int(st.session_state.get("laps", 60)),
+                pit_loss_s=float(st.session_state.get("pitloss", 22.0)),
+                pit_count_mean=float(st.session_state.get("pitmean", 2.0)),
+                sc_rate=float(st.session_state.get("sc", 0.35)),
+                team_order_prob=float(st.session_state.get("teamorder", 0.10)),
                 weather=wx,
             )
+            status.update(label="Done", state="complete")
         except Exception as e:
+            status.update(label="Failed", state="error")
             st.error(f"Error: {e}")
             st.stop()
 
     # Weather summary card
-    if wx_mode != "None" and wx is not None:
+    if st.session_state.get("wxmode", "None") != "None" and wx is not None:
         st.subheader("Weather (used in features)")
         cwx1, cwx2 = st.columns(2)
         with cwx1:
@@ -588,6 +624,13 @@ if run_btn:
     fmt["p_win"] = (fmt["p_win"] * 100).map(lambda x: f"{x:.1f}%")
     fmt["p_top3"] = (fmt["p_top3"] * 100).map(lambda x: f"{x:.1f}%")
     st.dataframe(fmt, hide_index=True, use_container_width=True)
+
+    # Downloads
+    cdl1, cdl2 = st.columns([1,1])
+    with cdl1:
+        st.download_button("Download CSV", data=ranking.to_csv(index=False).encode("utf-8"), file_name=f"podium_{gp.replace(' ','_')}.csv", mime="text/csv")
+    with cdl2:
+        st.download_button("Download JSON", data=ranking.to_json(orient="records").encode("utf-8"), file_name=f"podium_{gp.replace(' ','_')}.json", mime="application/json")
 
     podium = ranking.head(3).reset_index(drop=True)
     c1, c2, c3 = st.columns(3)
