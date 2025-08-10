@@ -86,6 +86,7 @@ TRACK_COORDS = {
     "Silverstone": (52.0733, -1.0140),
 }
 
+# ensure cache dir exists to avoid FastF1 NotADirectoryError
 os.makedirs("f1_cache", exist_ok=True)
 fastf1.Cache.enable_cache("f1_cache")
 
@@ -317,16 +318,36 @@ class GlobalRegressor:
     def fit(self, X: pd.DataFrame, y: pd.Series, groups: np.ndarray,
             drivers: Optional[pd.Series] = None) -> Dict[str, Any]:
         X_imp = self.imputer.fit_transform(X)
-        gkf = GroupKFold(n_splits=APP_CONFIG.cv.n_splits)
-        oof = np.zeros_like(y, dtype=float)
-        maes = []
-        for tr, te in gkf.split(X_imp, y, groups):
-            self.model.fit(X_imp[tr], y.iloc[tr])
-            pred = self.model.predict(X_imp[te])
-            oof[te] = pred
-            maes.append(mean_absolute_error(y.iloc[te], pred))
-        self.cv_score_ = float(np.mean(maes))
-        resid = y.values - oof
+        # Adjust CV folds to available groups; fallback if too few
+        uniq_groups = np.unique(groups)
+        n_groups = len(uniq_groups)
+        n_splits = min(APP_CONFIG.cv.n_splits, n_groups) if n_groups > 0 else 0
+        if n_splits >= 2:
+            gkf = GroupKFold(n_splits=n_splits)
+            oof = np.zeros_like(y, dtype=float)
+            maes = []
+            for tr, te in gkf.split(X_imp, y, groups):
+                self.model.fit(X_imp[tr], y.iloc[tr])
+                pred = self.model.predict(X_imp[te])
+                oof[te] = pred
+                maes.append(mean_absolute_error(y.iloc[te], pred))
+            self.cv_score_ = float(np.mean(maes))
+            resid = y.values - oof
+        else:
+            # Not enough groups for GroupKFold; fit once and use in-sample residuals
+            self.model.fit(X_imp, y)
+            pred_all = self.model.predict(X_imp)
+            self.cv_score_ = float(mean_absolute_error(y, pred_all))
+            resid = y.values - pred_all
+            # Fit quantiles on the same data in this fallback
+            self._fit_quantiles(X_imp, y)
+            # Driver residual stds
+            self.resid_std_global_ = float(np.std(resid)) if len(resid) else 0.25
+            if drivers is not None:
+                df_res = pd.DataFrame({"Driver": drivers.values, "resid": resid})
+                self.resid_std_by_driver_ = df_res.groupby("Driver")["resid"].std().dropna().to_dict()
+            return {"cv_mae": self.cv_score_, "resid_std": self.resid_std_global_}
+        # After CV, fit on all data and train quantile heads
         self.resid_std_global_ = float(np.std(resid)) if len(resid) else 0.25
         if drivers is not None:
             df_res = pd.DataFrame({"Driver": drivers.values, "resid": resid})
