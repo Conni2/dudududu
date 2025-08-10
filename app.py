@@ -456,6 +456,7 @@ class PodiumService:
         self.dual = DualGlobal(app_cfg.model, app_cfg.quant, w_mixed=w_mixed)
 
     def _train_dual(self, feat_clean: pd.DataFrame, feat_mixed: pd.DataFrame) -> Dict[str, Any]:
+        # Expect feats WITHOUT target race rows (caller ensures exclusion)
         mA = feat_clean["pace_median_s"].notna()
         XA = feat_clean.loc[mA].drop(columns=["pace_median_s", "season", "round", "circuit_id", "Driver", "race_id"], errors='ignore')
         yA = feat_clean.loc[mA, "pace_median_s"]
@@ -473,7 +474,9 @@ class PodiumService:
                         laps: int = 60, pit_loss_s: float = 22.0,
                         pit_count_mean: float = 2.0, sc_rate: float = 0.35,
                         team_order_prob: float = 0.10,
-                        weather: Optional[Dict[str, float]] = None) -> pd.DataFrame:
+                        weather: Optional[Dict[str, float]] = None),
+                        entries: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+        # 1) Load and build features
         laps_all = load_sessions(gp_track_key, seasons_for_training)
         if laps_all.empty:
             raise ValueError("No sessions loaded. Check track key/seasons.")
@@ -490,12 +493,104 @@ class PodiumService:
                 featB[k] = v
         featA = finalize_features(featA)
         featB = finalize_features(featB)
-        _ = self._train_dual(featA, featB)
-        maskA = featA["circuit_id"].astype(str).str.contains(gp_track_key, case=False, na=False)
-        maskB = featB["circuit_id"].astype(str).str.contains(gp_track_key, case=False, na=False)
-        XA = featA.loc[maskA].drop(columns=["pace_median_s", "season", "round", "circuit_id", "Driver", "race_id"], errors='ignore')
-        XB = featB.loc[maskB].drop(columns=["pace_median_s", "season", "round", "circuit_id", "Driver", "race_id"], errors='ignore')
-        drivers = featA.loc[maskA, "Driver"].reset_index(drop=True)
+
+        # 2) Choose target race = latest (season, round) for this GP among loaded data
+        maskA_all = featA["circuit_id"].astype(str).str.contains(gp_track_key, case=False, na=False)
+        if not maskA_all.any():
+            raise ValueError("No historical rows for target GP. Try adding more seasons.")
+        latest_season = int(featA.loc[maskA_all, "season"].max())
+        latest_round = int(featA.loc[(maskA_all) & (featA["season"] == latest_season), "round"].max())
+
+        # 3) Build inference rows strictly from that target race (avoids mixing seasons/drivers)
+        infA = featA[(featA["season"] == latest_season) & (featA["round"] == latest_round)].copy()
+        infB = featB[(featB["season"] == latest_season) & (featB["round"] == latest_round)].copy()
+        if len(infA) == 0 or len(infB) == 0:
+            raise ValueError("No inference rows for latest target race (missing Q/R data).")
+        
+        # 3a) If user provided current entries, align inference rows to those drivers and qualis
+        if entries is not None and len(entries) > 0:
+            ent = entries.copy()
+            # normalize columns
+            ent.columns = [c.strip() for c in ent.columns]
+            # standardize names
+            colmap = {c.lower(): c for c in ent.columns}
+            has_driver = "driver" in colmap
+            if not has_driver:
+                raise ValueError("Entries must include a 'Driver' column")
+            # unify column names to 'Driver','Team','QualiTime'
+            ent.rename(columns={colmap["driver"]: "Driver"}, inplace=True)
+            if "qualitime" in colmap: ent.rename(columns={colmap["qualitime"]: "QualiTime"}, inplace=True)
+            if "qualitime (s)" in colmap: ent.rename(columns={colmap["qualitime (s)"]: "QualiTime"}, inplace=True)
+            if "team" in colmap: ent.rename(columns={colmap["team"]: "Team"}, inplace=True)
+            keep_cols = [c for c in ["Driver","Team","QualiTime"] if c in ent.columns]
+            ent = ent[keep_cols]
+        
+            # restrict inference rows to listed drivers
+            listed = set(ent["Driver"].unique())
+            infA = infA[infA["Driver"].isin(listed)].copy()
+            infB = infB[infB["Driver"].isin(listed)].copy()
+            if len(infA) == 0:
+                raise ValueError("None of the provided drivers match the latest target race at this GP. Check names/case.")
+        
+            # apply quali override if provided
+            if "QualiTime" in ent.columns and ent["QualiTime"].notna().any():
+                def _to_seconds(x):
+                    try:
+                        return float(x)
+                    except Exception:
+                        s = str(x).strip()
+                        if ":" in s:
+                            mm, ss = s.split(":", 1)
+                            return float(mm) * 60 + float(ss)
+                        return np.nan
+                ent["best_q_s"] = ent["QualiTime"].apply(_to_seconds)
+                if ent["best_q_s"].notna().any():
+                    pole = float(np.nanmin(ent["best_q_s"].values))
+                    ent["gap_to_pole_s"] = ent["best_q_s"] - pole
+                    for df in (infA, infB):
+                        df.drop(columns=["best_q_s","gap_to_pole_s"], errors="ignore", inplace=True)
+                        df = df.merge(ent[["Driver","best_q_s","gap_to_pole_s"]], on="Driver", how="left")
+                        # reassign merged df back (since we used local variable)
+                        if df is infA: infA = df
+                        else: infB = df
+        
+        # features for inference
+        XA = infA.drop(columns=["pace_median_s", "season", "round", "circuit_id", "Driver", "race_id"], errors='ignore')
+        XB = infB.drop(columns=["pace_median_s", "season", "round", "circuit_id", "Driver", "race_id"], errors='ignore')
+        drivers = infA["Driver"].reset_index(drop=True)
+        
+        # 4) Train on everything EXCEPT the target race (prevents leakage and ghost drivers)
+        trA = featA[~((featA["season"] == latest_season) & (featA["round"] == latest_round))]
+        trB = featB[~((featB["season"] == latest_season) & (featB["round"] == latest_round))]
+        _ = self._train_dual(trA, trB)
+
+
+# features for inference
+XA = infA.drop(columns=["pace_median_s", "season", "round", "circuit_id", "Driver", "race_id"], errors='ignore')
+XB = infB.drop(columns=["pace_median_s", "season", "round", "circuit_id", "Driver", "race_id"], errors='ignore')
+drivers = infA["Driver"].reset_index(drop=True)
+
+# 4) Train on everything EXCEPT the target race (prevents leakage and ghost drivers)
+trA = featA[~((featA["season"] == latest_season) & (featA["round"] == latest_round))]
+trB = featB[~((featB["season"] == latest_season) & (featB["round"] == latest_round))]
+_ = self._train_dual(trA, trB)
+
+        infA = featA[(featA["season"] == latest_season) & (featA["round"] == latest_round)]
+        infB = featB[(featB["season"] == latest_season) & (featB["round"] == latest_round)]
+        if len(infA) == 0 or len(infB) == 0:
+            raise ValueError("No inference rows for latest target race (missing Q/R data).")
+
+        XA = infA.drop(columns=["pace_median_s", "season", "round", "circuit_id", "Driver", "race_id"], errors='ignore')
+        XB = infB.drop(columns=["pace_median_s", "season", "round", "circuit_id", "Driver", "race_id"], errors='ignore')
+        drivers = infA["Driver"].reset_index(drop=True)
+
+        # 4) Train on everything EXCEPT the target race (prevents leakage and ghost drivers)
+        trA = featA[~((featA["season"] == latest_season) & (featA["round"] == latest_round))]
+        trB = featB[~((featB["season"] == latest_season) & (featB["round"] == latest_round))]
+        if len(trA) < 10 or len(trB) < 10:
+            pass  # still train; caller shows CV fallback
+        _ = self._train_dual(trA, trB)
+
         if len(XA) == 0 or len(XB) == 0:
             raise ValueError("No inference rows for target GP.")
         q_blend = self.dual.predict_quantiles_blended(XA, XB)
@@ -549,6 +644,29 @@ with st.sidebar.expander("Advanced settings", expanded=False):
     wx_mode = st.selectbox("Weather source", ["None", "Forecast (Open-Meteo)", "Past 3 days avg (Open-Meteo)"], key="wxmode")
     lat_in = st.text_input("Latitude (optional)", value="", key="lat")
     lon_in = st.text_input("Longitude (optional)", value="", key="lon")
+
+# --- Entries / Qualifying (paste or upload) ---
+with st.sidebar.expander("Entries / Qualifying (optional)", expanded=False):
+    mode_ent = st.radio("How to provide entries?", ["Paste CSV", "Upload CSV", "None"], horizontal=True)
+    entries_df = None
+    sample = "Driver,Team,QualiTime\nVER,Red Bull,86.204\nNOR,McLaren,86.269\nPIA,McLaren,86.375\n"
+    if mode_ent == "Paste CSV":
+        txt = st.text_area("Paste CSV here", value=sample, height=160)
+        if txt.strip():
+            try:
+                import io
+                entries_df = pd.read_csv(io.StringIO(txt))
+                st.caption(f"Parsed {len(entries_df)} rows")
+            except Exception as e:
+                st.warning(f"CSV parse failed: {e}")
+    elif mode_ent == "Upload CSV":
+        f = st.file_uploader("Upload CSV", type=["csv"])
+        if f is not None:
+            try:
+                entries_df = pd.read_csv(f)
+                st.caption(f"Parsed {len(entries_df)} rows")
+            except Exception as e:
+                st.warning(f"CSV parse failed: {e}")
 
 # Cache tools
 colc1, colc2 = st.sidebar.columns([1,1])
