@@ -7,7 +7,7 @@ F1 Podium Predictor — Streamlit App (Dual Global clean+mixed + LightGBM + MC)
 실행:
     streamlit run app.py
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any
 import datetime as dt
 import requests
@@ -17,7 +17,16 @@ import fastf1
 from sklearn.model_selection import GroupKFold
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_absolute_error
-import lightgbm as lgb
+# LightGBM is optional; fall back to scikit-learn if missing
+try:
+    import lightgbm as lgb
+    HAS_LGB = True
+except Exception:
+    lgb = None
+    HAS_LGB = False
+    from sklearn.ensemble import GradientBoostingRegressor as SkGBR
+    import warnings
+    warnings.filterwarnings("ignore")
 import streamlit as st
 
 # ========================= Page Setup =========================
@@ -55,10 +64,10 @@ class SimulationConfig:
 
 @dataclass
 class AppConfig:
-    cv: CVConfig = CVConfig()
-    model: ModelConfig = ModelConfig()
-    quant: QuantileConfig = QuantileConfig()
-    sim: SimulationConfig = SimulationConfig()
+    cv: CVConfig = field(default_factory=CVConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
+    quant: QuantileConfig = field(default_factory=QuantileConfig)
+    sim: SimulationConfig = field(default_factory=SimulationConfig)
 
 APP_CONFIG = AppConfig()
 
@@ -237,25 +246,37 @@ def finalize_features(df: pd.DataFrame) -> pd.DataFrame:
 
 # ========================= Models (LightGBM + Quantile) =========================
 class GlobalRegressor:
-    """LightGBM global regressor with optional quantile heads and OOF residual stats."""
+    """Global regressor with optional quantile heads and OOF residual stats.
+    - Uses LightGBM when available; otherwise falls back to sklearn GradientBoostingRegressor.
+    """
     def __init__(self, cfg: ModelConfig, qcfg: QuantileConfig):
         self.cfg = cfg
         self.qcfg = qcfg
-        self.model = lgb.LGBMRegressor(
-            objective=cfg.objective,
-            learning_rate=cfg.learning_rate,
-            n_estimators=cfg.n_estimators,
-            num_leaves=self.cfg.num_leaves,
-            max_depth=cfg.max_depth,
-            min_child_samples=cfg.min_data_in_leaf,
-            reg_alpha=cfg.reg_alpha,
-            reg_lambda=cfg.reg_lambda,
-            subsample=cfg.subsample,
-            colsample_bytree=cfg.colsample_bytree,
-            random_state=42,
-        )
+        if HAS_LGB:
+            self.model = lgb.LGBMRegressor(
+                objective=cfg.objective,
+                learning_rate=cfg.learning_rate,
+                n_estimators=cfg.n_estimators,
+                num_leaves=self.cfg.num_leaves,
+                max_depth=cfg.max_depth,
+                min_child_samples=cfg.min_data_in_leaf,
+                reg_alpha=cfg.reg_alpha,
+                reg_lambda=cfg.reg_lambda,
+                subsample=cfg.subsample,
+                colsample_bytree=cfg.colsample_bytree,
+                random_state=42,
+            )
+        else:
+            # sklearn fallback (no leaves/colsample params)
+            self.model = SkGBR(
+                loss="squared_error",
+                learning_rate=self.cfg.learning_rate,
+                n_estimators=self.cfg.n_estimators,
+                max_depth=None if self.cfg.max_depth == -1 else self.cfg.max_depth,
+                random_state=42,
+            )
         self.imputer = SimpleImputer(strategy="median")
-        self.q_models: Dict[float, lgb.LGBMRegressor] = {}
+        self.q_models: Dict[float, Any] = {}
         self.resid_std_global_: float = 0.25
         self.resid_std_by_driver_: Dict[str, float] = {}
 
@@ -264,19 +285,30 @@ class GlobalRegressor:
         if not self.qcfg.use_quantile:
             return
         for q in self.qcfg.quantiles:
-            qm = lgb.LGBMRegressor(
-                objective='quantile', alpha=q,
-                learning_rate=self.cfg.learning_rate,
-                n_estimators=self.cfg.n_estimators,
-                num_leaves=self.cfg.num_leaves,
-                max_depth=self.cfg.max_depth,
-                min_child_samples=self.cfg.min_data_in_leaf,
-                reg_alpha=self.cfg.reg_alpha,
-                reg_lambda=self.cfg.reg_lambda,
-                subsample=self.cfg.subsample,
-                colsample_bytree=self.cfg.colsample_bytree,
-                random_state=42,
-            )
+            if HAS_LGB:
+                qm = lgb.LGBMRegressor(
+                    objective='quantile', alpha=q,
+                    learning_rate=self.cfg.learning_rate,
+                    n_estimators=self.cfg.n_estimators,
+                    num_leaves=self.cfg.num_leaves,
+                    max_depth=self.cfg.max_depth,
+                    min_child_samples=self.cfg.min_data_in_leaf,
+                    reg_alpha=self.cfg.reg_alpha,
+                    reg_lambda=self.cfg.reg_lambda,
+                    subsample=self.cfg.subsample,
+                    colsample_bytree=self.cfg.colsample_bytree,
+                    random_state=42,
+                )
+            else:
+                # sklearn GradientBoostingRegressor supports quantile via loss='quantile'
+                qm = SkGBR(
+                    loss='quantile',
+                    alpha=q,
+                    learning_rate=self.cfg.learning_rate,
+                    n_estimators=self.cfg.n_estimators,
+                    max_depth=None if self.cfg.max_depth == -1 else self.cfg.max_depth,
+                    random_state=42,
+                )
             qm.fit(Xtr, ytr)
             self.q_models[q] = qm
 
