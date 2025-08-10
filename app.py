@@ -168,7 +168,8 @@ def load_sessions(track_key: str, seasons: Tuple[int, ...]) -> pd.DataFrame:
     recs = []
     for season in seasons:
         rnd = _find_round_in_schedule(season, track_key)
-        for sess in ("Q", "R"):
+        # FP 포함해서 모두 수집
+        for sess in ("FP1", "FP2", "FP3", "Q", "R"):
             try:
                 session = fastf1.get_session(season, rnd if rnd != -1 else track_key, sess)
                 session.load()
@@ -180,7 +181,6 @@ def load_sessions(track_key: str, seasons: Tuple[int, ...]) -> pd.DataFrame:
             except Exception:
                 continue
     return pd.concat(recs, ignore_index=True) if recs else pd.DataFrame()
-
 
 def clean_laps(df_laps: pd.DataFrame, mode: str = "clean") -> pd.DataFrame:
     df = df_laps.copy()
@@ -241,11 +241,74 @@ def finalize_features(df: pd.DataFrame) -> pd.DataFrame:
     cols = [
         "gap_to_pole_s", "best_q_s",
         "sector_sum_s", "s1_mean_s", "s2_mean_s", "s3_mean_s",
+        # FP features
+        "fp_median_s", "fp_std_s", "fp_stint_len_max",
         # weather (optional)
         "temp_c", "rain_prob",
     ]
     keep = [c for c in cols if c in df.columns]
     return df[keep + ["pace_median_s", "season", "round", "circuit_id", "Driver", "race_id"]]
+
+def _max_consecutive_run_length(df: pd.DataFrame) -> int:
+    # 세션 내에서 LapNumber 연속 구간의 최대 길이(피트 인/아웃 제거된 상태 전제)
+    if df.empty or "LapNumber" not in df.columns:
+        return 0
+    s = df.sort_values("LapNumber")["LapNumber"].to_numpy()
+    if len(s) == 0:
+        return 0
+    max_len = cur = 1
+    for i in range(1, len(s)):
+        if s[i] == s[i-1] + 1:
+            cur += 1
+            if cur > max_len:
+                max_len = cur
+        else:
+            cur = 1
+    return int(max_len)
+
+def add_practice_features(df_driver_race: pd.DataFrame, df_laps_all: pd.DataFrame) -> pd.DataFrame:
+    """FP1/2/3에서 드라이버-레이스 기준으로:
+       - fp_median_s: FP 랩타임 중앙값(세션별 중앙값의 중앙)
+       - fp_std_s:    FP 랩타임 표준편차(세션별 표준편차의 중앙)
+       - fp_stint_len_max: 연속 주행(피트 X) 최장 랩 수의 최대
+    """
+    df_fp = df_laps_all[df_laps_all["session"].isin(["FP1", "FP2", "FP3"])].copy()
+    if df_fp.empty:
+        return df_driver_race
+
+    # 이미 clean_laps에서 _s 만들어두지만 안전하게 보정
+    if "LapTime_s" not in df_fp.columns and "LapTime" in df_fp.columns:
+        df_fp["LapTime_s"] = df_fp["LapTime"].dt.total_seconds()
+
+    grp_keys = ["season", "round", "circuit_id", "Driver", "session"]
+    # 세션별 통계
+    per_sess = df_fp.groupby(grp_keys).agg(
+        fp_med_s=("LapTime_s", "median"),
+        fp_std_s=("LapTime_s", "std"),
+        _rows=("LapNumber", "count"),
+    ).reset_index()
+
+    # 세션별 최장 연속 주행 길이
+    stint_rows = []
+    for (season, rnd, circ, drv, sess), g in df_fp.groupby(grp_keys, dropna=False):
+        stint_rows.append({
+            "season": season, "round": rnd, "circuit_id": circ, "Driver": drv, "session": sess,
+            "stint_len_max": _max_consecutive_run_length(g)
+        })
+    per_sess_stint = pd.DataFrame(stint_rows)
+
+    per_sess = per_sess.merge(per_sess_stint, on=grp_keys, how="left")
+
+    # 레이스 기준 합치기(세션들 요약)
+    grp_keys_race = ["season", "round", "circuit_id", "Driver"]
+    per_race = per_sess.groupby(grp_keys_race).agg(
+        fp_median_s=("fp_med_s", "median"),
+        fp_std_s=("fp_std_s", "median"),
+        fp_stint_len_max=("stint_len_max", "max"),
+    ).reset_index()
+
+    return df_driver_race.merge(per_race, on=grp_keys_race, how="left")
+
 
 # ========================= Models (LightGBM + Quantile) =========================
 class GlobalRegressor:
@@ -484,8 +547,8 @@ class PodiumService:
         laps_mixed = clean_laps(laps_all, mode="mixed")
         drA = build_driver_race_table(laps_clean)
         drB = build_driver_race_table(laps_mixed)
-        featA = add_quali_features(drA, laps_clean)
-        featB = add_quali_features(drB, laps_mixed)
+        featA = add_practice_features(featA, laps_clean)
+        featB = add_practice_features(featB, laps_mixed)
         # attach weather (constant per race) if provided
         if weather is not None:
             for k, v in weather.items():
