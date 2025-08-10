@@ -514,7 +514,6 @@ if run_btn:
                 sc_rate=float(sc_rate),
                 team_order_prob=float(team_order_prob),
                 weather=wx,
-            )
                 gp_track_key=gp,
                 date=date,
                 seasons_for_training=seasons_tuple,
