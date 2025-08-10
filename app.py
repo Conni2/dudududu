@@ -77,7 +77,6 @@ TRACK_COORDS = {
 }
 
 fastf1.Cache.enable_cache("f1_cache")
-fastf1.Cache.enable_cache("f1_cache")
 
 @st.cache_data(show_spinner=False)
 def _find_round_in_schedule(season: int, track_key: str) -> int:
@@ -514,14 +513,6 @@ if run_btn:
                 sc_rate=float(sc_rate),
                 team_order_prob=float(team_order_prob),
                 weather=wx,
-                gp_track_key=gp,
-                date=date,
-                seasons_for_training=seasons_tuple,
-                laps=int(laps),
-                pit_loss_s=float(pit_loss_s),
-                pit_count_mean=float(pit_count_mean),
-                sc_rate=float(sc_rate),
-                team_order_prob=float(team_order_prob),
             )
         except Exception as e:
             st.error(f"Error: {e}")
@@ -556,7 +547,6 @@ if run_btn:
     st.subheader("Win probability")
     st.bar_chart(ranking.set_index("Driver")["p_win"])
 
-    st.caption("Note: No track meta or weather API attached yet — pit/sc params are user-specified. Quantile + OOF residuals drive uncertainty.")
+    st.caption("Note: Track meta CSV not attached yet — pit/SC params are user-specified. Weather uses Open‑Meteo; uncertainty from quantiles + OOF residuals.")
 else:
     st.info("👈 사이드바에서 GP와 파라미터를 설정하고 **Predict podium**을 눌러주세요.")
-
