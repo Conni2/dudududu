@@ -474,7 +474,7 @@ class PodiumService:
                         laps: int = 60, pit_loss_s: float = 22.0,
                         pit_count_mean: float = 2.0, sc_rate: float = 0.35,
                         team_order_prob: float = 0.10,
-                        weather: Optional[Dict[str, float]] = None),
+                        weather: Optional[Dict[str, float]] = None,
                         entries: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         # 1) Load and build features
         laps_all = load_sessions(gp_track_key, seasons_for_training)
