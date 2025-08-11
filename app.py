@@ -1,25 +1,32 @@
 """
-F1 Podium Predictor — Streamlit App (Dual Global clean+mixed + LightGBM + MC)
-- FP1/FP2/FP3 롱런 피처 포함
-- FastF1로 과거 퀄리 결과 자동 채우기(옵션)
-- 수동 엔트리/퀄리 붙여넣기/업로드(옵션)
-- 메타테이블 없어도 실행 가능
+F1 Podium Predictor — Streamlit (Dual Global clean+mixed + LightGBM + MC)
+- FastF1에서 히스토리 로드 + 현재 엔트리/퀄리 자동 주입(또는 CSV)
+- 최근 시즌 가중치(최종 fit) 적용
+- Quantile + OOF 기반 불확실성 + Monte Carlo 시뮬
 
-실행:
+run:
     streamlit run app.py
 """
+
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple, Any
-import os, io
+from typing import Dict, Optional, Tuple, Any
+import os
+import io
+import traceback
+import textwrap
 import datetime as dt
-import requests
+
 import numpy as np
 import pandas as pd
+import requests
+import streamlit as st
 import fastf1
+
 from sklearn.model_selection import GroupKFold
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_absolute_error
-# LightGBM is optional; fall back to scikit-learn if missing
+
+# LightGBM optional
 try:
     import lightgbm as lgb
     HAS_LGB = True
@@ -29,14 +36,13 @@ except Exception:
     from sklearn.ensemble import GradientBoostingRegressor as SkGBR
     import warnings
     warnings.filterwarnings("ignore")
-import streamlit as st
 
-# ========================= Page Setup =========================
+# ---------------- UI setup ----------------
 st.set_page_config(page_title="F1 Podium Predictor", layout="wide")
 st.title("🏁 F1 Podium Predictor")
-st.caption("Dual Global (clean + mixed) · FP features · LightGBM + Quantile · Monte Carlo simulation · Weather-ready")
+st.caption("Dual Global (clean + mixed) · FP/Q features · LightGBM + Quantile · Monte Carlo simulation · Weather-ready")
 
-# ========================= Config =========================
+# ---------------- Config ----------------
 @dataclass
 class CVConfig:
     n_splits: int = 5
@@ -73,7 +79,7 @@ class AppConfig:
 
 APP_CONFIG = AppConfig()
 
-# ========================= Helpers =========================
+# ---------------- Helpers ----------------
 TRACK_COORDS = {
     "Monaco": (43.7347, 7.4206),
     "Saudi Arabia": (21.6319, 39.1044),
@@ -84,9 +90,10 @@ TRACK_COORDS = {
     "Imola": (44.3439, 11.7167),
     "Monza": (45.6214, 9.2811),
     "Silverstone": (52.0733, -1.0140),
+    "Spain": (41.5700, 2.2610),
+    "Canada": (45.5030, -73.5220),
 }
 
-# ensure cache dir exists to avoid FastF1 NotADirectoryError
 os.makedirs("f1_cache", exist_ok=True)
 fastf1.Cache.enable_cache("f1_cache")
 
@@ -103,7 +110,7 @@ def _find_round_in_schedule(season: int, track_key: str) -> int:
     return -1
 
 @st.cache_data(show_spinner=False)
-def _coalesce_coords(track_key: str, lat_in: Optional[float], lon_in: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+def _coalesce_coords(track_key: str, lat_in: Optional[float], lon_in: Optional[float]):
     if lat_in is not None and lon_in is not None:
         return lat_in, lon_in
     for k, (la, lo) in TRACK_COORDS.items():
@@ -120,7 +127,7 @@ def _parse_date(date_str: str) -> dt.date:
 
 @st.cache_data(show_spinner=False)
 def fetch_weather_open_meteo(lat: float, lon: float, date_str: str, mode: str = "forecast") -> Dict[str, float]:
-    """Return {"temp_c": float, "rain_prob": float in 0..1}. Uses Open-Meteo (no API key)."""
+    """Return {"temp_c": float, "rain_prob": 0..1}. Uses Open-Meteo (no API key)."""
     d = _parse_date(date_str)
     if mode == "forecast":
         url = (
@@ -128,23 +135,7 @@ def fetch_weather_open_meteo(lat: float, lon: float, date_str: str, mode: str = 
             f"&hourly=temperature_2m,precipitation_probability&timezone=auto"
             f"&start_date={d.isoformat()}&end_date={d.isoformat()}"
         )
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
-        js = r.json()
-        hours = js.get("hourly", {}).get("time", [])
-        temps = js.get("hourly", {}).get("temperature_2m", [])
-        pops = js.get("hourly", {}).get("precipitation_probability", [])
-        target = f"{d.isoformat()}T14:00"
-        if target in hours:
-            i = hours.index(target)
-            temp_c = float(temps[i]) if i < len(temps) else float(np.nan)
-            pop = float(pops[i]) / 100.0 if i < len(pops) else float(np.nan)
-        else:
-            temp_c = float(np.nanmean(temps)) if temps else float("nan")
-            pop = float(np.nanmean(pops))/100.0 if pops else float("nan")
-        return {"temp_c": temp_c, "rain_prob": max(0.0, min(1.0, pop))}
     else:
-        # past 3 days average (d-3 .. d-1)
         start = (d - dt.timedelta(days=3)).isoformat()
         end = (d - dt.timedelta(days=1)).isoformat()
         url = (
@@ -152,23 +143,30 @@ def fetch_weather_open_meteo(lat: float, lon: float, date_str: str, mode: str = 
             f"&hourly=temperature_2m,precipitation_probability&timezone=auto"
             f"&start_date={start}&end_date={end}"
         )
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
-        js = r.json()
-        temps = js.get("hourly", {}).get("temperature_2m", [])
-        pops = js.get("hourly", {}).get("precipitation_probability", [])
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    js = r.json()
+    hours = js.get("hourly", {}).get("time", [])
+    temps = js.get("hourly", {}).get("temperature_2m", [])
+    pops = js.get("hourly", {}).get("precipitation_probability", [])
+    # choose 14:00 local if available, else daily mean
+    target = f"{_parse_date(date_str).isoformat()}T14:00"
+    if hours and target in hours:
+        i = hours.index(target)
+        temp_c = float(temps[i]) if i < len(temps) else float(np.nan)
+        pop = float(pops[i]) / 100.0 if i < len(pops) else float(np.nan)
+    else:
         temp_c = float(np.nanmean(temps)) if temps else float("nan")
         pop = float(np.nanmean(pops))/100.0 if pops else float("nan")
-        return {"temp_c": temp_c, "rain_prob": max(0.0, min(1.0, pop))}
+    return {"temp_c": temp_c, "rain_prob": max(0.0, min(1.0, pop))}
 
-# ========================= Data Loading (FP+Q+R) =========================
+# ---------------- Data loading & cleaning ----------------
 @st.cache_data(show_spinner=True)
 def load_sessions(track_key: str, seasons: Tuple[int, ...]) -> pd.DataFrame:
     recs = []
     for season in seasons:
         rnd = _find_round_in_schedule(season, track_key)
-        # include FP1/FP2/FP3 + Q + R
-        for sess in ("FP1", "FP2", "FP3", "Q", "R"):
+        for sess in ("Q", "R"):
             try:
                 session = fastf1.get_session(season, rnd if rnd != -1 else track_key, sess)
                 session.load()
@@ -181,7 +179,6 @@ def load_sessions(track_key: str, seasons: Tuple[int, ...]) -> pd.DataFrame:
                 continue
     return pd.concat(recs, ignore_index=True) if recs else pd.DataFrame()
 
-# ========================= Cleaning =========================
 def clean_laps(df_laps: pd.DataFrame, mode: str = "clean") -> pd.DataFrame:
     df = df_laps.copy()
     for col in ["LapTime", "Sector1Time", "Sector2Time", "Sector3Time"]:
@@ -209,7 +206,7 @@ def clean_laps(df_laps: pd.DataFrame, mode: str = "clean") -> pd.DataFrame:
     df["data_mode"] = mode
     return df
 
-# ========================= Feature Engineering =========================
+# ---------------- Feature engineering ----------------
 def build_driver_race_table(df_laps: pd.DataFrame) -> pd.DataFrame:
     df = df_laps.copy()
     grp = ["season", "round", "circuit_id", "Driver"]
@@ -235,76 +232,39 @@ def add_quali_features(df_driver_race: pd.DataFrame, df_laps_all: pd.DataFrame) 
     feat["gap_to_pole_s"] = feat["best_q_s"] - feat["pole_s"]
     return df_driver_race.merge(feat, on=["season","round","circuit_id","Driver"], how="left")
 
-def _max_consecutive_run_length(df: pd.DataFrame) -> int:
-    if df.empty or "LapNumber" not in df.columns:
-        return 0
-    s = df.sort_values("LapNumber")["LapNumber"].to_numpy()
-    if len(s) == 0:
-        return 0
-    max_len = cur = 1
-    for i in range(1, len(s)):
-        if s[i] == s[i-1] + 1:
-            cur += 1
-            if cur > max_len:
-                max_len = cur
-        else:
-            cur = 1
-    return int(max_len)
-
-def add_practice_features(df_driver_race: pd.DataFrame, df_laps_all: pd.DataFrame) -> pd.DataFrame:
-    """FP1/2/3에서 드라이버-레이스 기준:
-       - fp_median_s: 세션별 LapTime_s 중앙값들의 중앙
-       - fp_std_s:    세션별 LapTime_s 표준편차의 중앙
-       - fp_stint_len_max: 연속 주행 최장 랩 수의 최대
-    """
-    df_fp = df_laps_all[df_laps_all["session"].isin(["FP1", "FP2", "FP3"])].copy()
-    if df_fp.empty:
-        return df_driver_race
-    if "LapTime_s" not in df_fp.columns and "LapTime" in df_fp.columns:
-        df_fp["LapTime_s"] = df_fp["LapTime"].dt.total_seconds()
-
-    grp_keys = ["season", "round", "circuit_id", "Driver", "session"]
-    per_sess = df_fp.groupby(grp_keys).agg(
-        fp_med_s=("LapTime_s", "median"),
-        fp_std_s=("LapTime_s", "std"),
-        _rows=("LapNumber", "count"),
-    ).reset_index()
-
-    stint_rows = []
-    for (season, rnd, circ, drv, sess), g in df_fp.groupby(grp_keys, dropna=False):
-        stint_rows.append({
-            "season": season, "round": rnd, "circuit_id": circ, "Driver": drv, "session": sess,
-            "stint_len_max": _max_consecutive_run_length(g)
-        })
-    per_sess_stint = pd.DataFrame(stint_rows)
-    per_sess = per_sess.merge(per_sess_stint, on=grp_keys, how="left")
-
-    grp_keys_race = ["season", "round", "circuit_id", "Driver"]
-    per_race = per_sess.groupby(grp_keys_race).agg(
-        fp_median_s=("fp_med_s", "median"),
-        fp_std_s=("fp_std_s", "median"),
-        fp_stint_len_max=("stint_len_max", "max"),
-    ).reset_index()
-
-    return df_driver_race.merge(per_race, on=grp_keys_race, how="left")
-
 def finalize_features(df: pd.DataFrame) -> pd.DataFrame:
     cols = [
         "gap_to_pole_s", "best_q_s",
         "sector_sum_s", "s1_mean_s", "s2_mean_s", "s3_mean_s",
-        # FP features
-        "fp_median_s", "fp_std_s", "fp_stint_len_max",
-        # weather (optional)
         "temp_c", "rain_prob",
     ]
     keep = [c for c in cols if c in df.columns]
     return df[keep + ["pace_median_s", "season", "round", "circuit_id", "Driver", "race_id"]]
 
-# ========================= Models (LightGBM + Quantile) =========================
+# ---------------- Autofill current entries/quali ----------------
+def autofill_entries_from_fastf1(season: int, round_or_key, track_key_fallback: Optional[str] = None) -> Optional[pd.DataFrame]:
+    """Return DataFrame columns: Driver, Team(optional), QualiTime(best_q_s seconds)."""
+    try:
+        sess = fastf1.get_session(season, round_or_key if isinstance(round_or_key, int) else track_key_fallback or round_or_key, "Q")
+        sess.load()
+        qlaps = sess.laps.copy()
+        if qlaps.empty:
+            return None
+        qlaps["best_q_s"] = qlaps["LapTime"].dt.total_seconds()
+        best = qlaps.groupby("Driver")["best_q_s"].min().reset_index()
+        # Try to map team from laps if available
+        team_map = {}
+        if "Team" in qlaps.columns:
+            team_map = qlaps.groupby("Driver")["Team"].agg(lambda s: s.dropna().iloc[0] if len(s.dropna()) else np.nan).to_dict()
+        best["Team"] = best["Driver"].map(team_map) if team_map else np.nan
+        best.rename(columns={"best_q_s": "QualiTime"}, inplace=True)
+        return best[["Driver", "Team", "QualiTime"]]
+    except Exception:
+        return None
+
+# ---------------- Models ----------------
 class GlobalRegressor:
-    """Global regressor with optional quantile heads and OOF residual stats.
-    - Uses LightGBM when available; otherwise falls back to sklearn GradientBoostingRegressor.
-    """
+    """LightGBM (or SkGBR fallback) + optional quantile heads; tracks OOF residual dispersion."""
     def __init__(self, cfg: ModelConfig, qcfg: QuantileConfig):
         self.cfg = cfg
         self.qcfg = qcfg
@@ -312,23 +272,22 @@ class GlobalRegressor:
             self.model = lgb.LGBMRegressor(
                 objective=cfg.objective,
                 learning_rate=cfg.learning_rate,
-                n_estimators=self.cfg.n_estimators,
-                num_leaves=self.cfg.num_leaves,
-                max_depth=self.cfg.max_depth,
-                min_child_samples=self.cfg.min_data_in_leaf,
-                reg_alpha=self.cfg.reg_alpha,
-                reg_lambda=self.cfg.reg_lambda,
-                subsample=self.cfg.subsample,
-                colsample_bytree=self.cfg.colsample_bytree,
+                n_estimators=cfg.n_estimators,
+                num_leaves=cfg.num_leaves,
+                max_depth=cfg.max_depth,
+                min_child_samples=cfg.min_data_in_leaf,
+                reg_alpha=cfg.reg_alpha,
+                reg_lambda=cfg.reg_lambda,
+                subsample=cfg.subsample,
+                colsample_bytree=cfg.colsample_bytree,
                 random_state=42,
             )
         else:
-            # sklearn fallback (no leaves/colsample params)
             self.model = SkGBR(
                 loss="squared_error",
-                learning_rate=self.cfg.learning_rate,
-                n_estimators=self.cfg.n_estimators,
-                max_depth=None if self.cfg.max_depth == -1 else self.cfg.max_depth,
+                learning_rate=cfg.learning_rate,
+                n_estimators=cfg.n_estimators,
+                max_depth=None if cfg.max_depth == -1 else cfg.max_depth,
                 random_state=42,
             )
         self.imputer = SimpleImputer(strategy="median")
@@ -343,7 +302,7 @@ class GlobalRegressor:
         for q in self.qcfg.quantiles:
             if HAS_LGB:
                 qm = lgb.LGBMRegressor(
-                    objective='quantile', alpha=q,
+                    objective="quantile", alpha=q,
                     learning_rate=self.cfg.learning_rate,
                     n_estimators=self.cfg.n_estimators,
                     num_leaves=self.cfg.num_leaves,
@@ -357,8 +316,7 @@ class GlobalRegressor:
                 )
             else:
                 qm = SkGBR(
-                    loss='quantile',
-                    alpha=q,
+                    loss="quantile", alpha=q,
                     learning_rate=self.cfg.learning_rate,
                     n_estimators=self.cfg.n_estimators,
                     max_depth=None if self.cfg.max_depth == -1 else self.cfg.max_depth,
@@ -368,44 +326,51 @@ class GlobalRegressor:
             self.q_models[q] = qm
 
     def fit(self, X: pd.DataFrame, y: pd.Series, groups: np.ndarray,
-            drivers: Optional[pd.Series] = None) -> Dict[str, Any]:
+            drivers: Optional[pd.Series] = None,
+            sample_weight: Optional[np.ndarray] = None) -> Dict[str, Any]:
         X_imp = self.imputer.fit_transform(X)
-        # Adjust CV folds to available groups; fallback if too few
+        # CV folds auto-adjust
         uniq_groups = np.unique(groups)
         n_groups = len(uniq_groups)
         n_splits = min(APP_CONFIG.cv.n_splits, n_groups) if n_groups > 0 else 0
+
         if n_splits >= 2:
             gkf = GroupKFold(n_splits=n_splits)
             oof = np.zeros_like(y, dtype=float)
             maes = []
             for tr, te in gkf.split(X_imp, y, groups):
-                self.model.fit(X_imp[tr], y.iloc[tr])
+                if HAS_LGB:
+                    self.model.fit(X_imp[tr], y.iloc[tr],
+                                   sample_weight=None if sample_weight is None else sample_weight[tr])
+                else:
+                    self.model.fit(X_imp[tr], y.iloc[tr])
                 pred = self.model.predict(X_imp[te])
                 oof[te] = pred
                 maes.append(mean_absolute_error(y.iloc[te], pred))
             self.cv_score_ = float(np.mean(maes))
             resid = y.values - oof
         else:
-            # Not enough groups for GroupKFold; fit once and use in-sample residuals
-            self.model.fit(X_imp, y)
+            # fallback
+            if HAS_LGB:
+                self.model.fit(X_imp, y, sample_weight=sample_weight)
+            else:
+                self.model.fit(X_imp, y)
             pred_all = self.model.predict(X_imp)
             self.cv_score_ = float(mean_absolute_error(y, pred_all))
             resid = y.values - pred_all
-            # Fit quantiles on the same data in this fallback
-            self._fit_quantiles(X_imp, y)
-            self.resid_std_global_ = float(np.std(resid)) if len(resid) else 0.25
-            if drivers is not None:
-                df_res = pd.DataFrame({"Driver": drivers.values, "resid": resid})
-                self.resid_std_by_driver_ = df_res.groupby("Driver")["resid"].std().dropna().to_dict()
-            return {"cv_mae": self.cv_score_, "resid_std": self.resid_std_global_}
-        # After CV, fit on all data and train quantile heads
+
+        # final fit on all data (with recency weight if provided)
+        if HAS_LGB:
+            self.model.fit(X_imp, y, sample_weight=sample_weight)
+        else:
+            self.model.fit(X_imp, y)
+        self._fit_quantiles(X_imp, y)
+
         self.resid_std_global_ = float(np.std(resid)) if len(resid) else 0.25
         if drivers is not None:
             df_res = pd.DataFrame({"Driver": drivers.values, "resid": resid})
             self.resid_std_by_driver_ = df_res.groupby("Driver")["resid"].std().dropna().to_dict()
-        self.model.fit(X_imp, y)
-        self._fit_quantiles(X_imp, y)
-        return {"cv_mae": self.resid_std_global_, "resid_std": self.resid_std_global_}
+        return {"cv_mae": getattr(self, "cv_score_", np.nan), "resid_std": self.resid_std_global_}
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         return self.model.predict(self.imputer.transform(X))
@@ -416,7 +381,8 @@ class GlobalRegressor:
         X_imp = self.imputer.transform(X)
         return {q: m.predict(X_imp) for q, m in self.q_models.items()}
 
-    def sigma_from_quantiles(self, q20: np.ndarray, q80: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def sigma_from_quantiles(q20: np.ndarray, q80: np.ndarray) -> np.ndarray:
         denom = 2 * 0.841621233
         spread = np.maximum(q80 - q20, 1e-6)
         return spread / denom
@@ -433,15 +399,14 @@ class DualGlobal:
         self.w_mixed = float(np.clip(w_mixed, 0.0, 1.0))
 
     def fit(self,
-            X_clean: pd.DataFrame, y_clean: pd.Series, g_clean: np.ndarray, d_clean: pd.Series,
-            X_mixed: pd.DataFrame, y_mixed: pd.Series, g_mixed: np.ndarray, d_mixed: pd.Series) -> Dict[str, Any]:
-        sA = self.A.fit(X_clean, y_clean, g_clean, drivers=d_clean)
-        sB = self.B.fit(X_mixed, y_mixed, g_mixed, drivers=d_mixed)
+            X_clean, y_clean, g_clean, d_clean, w_clean,
+            X_mixed, y_mixed, g_mixed, d_mixed, w_mixed) -> Dict[str, Any]:
+        sA = self.A.fit(X_clean, y_clean, g_clean, drivers=d_clean, sample_weight=w_clean)
+        sB = self.B.fit(X_mixed, y_mixed, g_mixed, drivers=d_mixed, sample_weight=w_mixed)
         return {"clean_cv_mae": sA["cv_mae"], "mixed_cv_mae": sB["cv_mae"], "w_mixed": self.w_mixed}
 
     def predict_blended(self, X_clean: pd.DataFrame, X_mixed: pd.DataFrame) -> np.ndarray:
-        ya = self.A.predict(X_clean)
-        yb = self.B.predict(X_mixed)
+        ya = self.A.predict(X_clean); yb = self.B.predict(X_mixed)
         return self.w_mixed * yb + (1 - self.w_mixed) * ya
 
     def predict_quantiles_blended(self, X_clean: pd.DataFrame, X_mixed: pd.DataFrame) -> Dict[float, np.ndarray]:
@@ -454,17 +419,10 @@ class DualGlobal:
         sig_q = None
         if 0.2 in q_blend and 0.8 in q_blend:
             sig_q = self.A.sigma_from_quantiles(q_blend[0.2], q_blend[0.8])
-        sig_res_A = self.A.sigma_for_drivers(drivers)
-        sig_res_B = self.B.sigma_for_drivers(drivers)
-        sig_res = np.maximum(sig_res_A, sig_res_B)
-        if sig_q is None:
-            return sig_res
-        return np.maximum(sig_q, sig_res)
+        sig_res = np.maximum(self.A.sigma_for_drivers(drivers), self.B.sigma_for_drivers(drivers))
+        return np.maximum(sig_q, sig_res) if sig_q is not None else sig_res
 
-# ========================= MC Simulator =========================
-class PodiumResult(Tuple[pd.DataFrame, pd.DataFrame]):
-    pass
-
+# ---------------- MC simulator ----------------
 def monte_carlo_podium(drivers: pd.Series,
                        base_time_s: np.ndarray,
                        pace_std_s: np.ndarray,
@@ -473,77 +431,37 @@ def monte_carlo_podium(drivers: pd.Series,
                        pit_count_mean: float,
                        sc_rate: float,
                        team_order_prob: float,
-                       n_runs: int = APP_CONFIG.sim.n_runs,
-                       seed: int = APP_CONFIG.sim.rng_seed) -> Any:
+                       n_runs: int,
+                       seed: int):
     rng = np.random.default_rng(seed)
     n = len(drivers)
     total_times = np.zeros((n_runs, n), dtype=float)
-    for r in range(n_runs):
+    for _ in range(n_runs):
         pace_noise = rng.normal(0.0, pace_std_s, size=(n,))
         pit_counts = rng.poisson(lam=max(pit_count_mean, 0.0), size=(n,))
-        sc_flag = rng.random() < sc_rate
-        sc_penalty = rng.normal(0.0, 3.0) if sc_flag else 0.0
+        sc_penalty = rng.normal(0.0, 3.0) if (rng.random() < sc_rate) else 0.0
         times = (base_time_s + pace_noise) * laps + pit_counts * pit_loss_s + sc_penalty
-        if team_order_prob > 0 and rng.random() < team_order_prob:
+        # team order swap (toy)
+        if team_order_prob > 0 and rng.random() < team_order_prob and n >= 2:
             idx = np.argsort(times)
-            if len(idx) >= 2:
-                i0, i1 = idx[0], idx[1]
-                times[i0], times[i1] = times[i1], times[i0]
-        total_times[r, :] = times
+            i0, i1 = idx[0], idx[1]
+            times[i0], times[i1] = times[i1], times[i0]
+        total_times[_] = times
     mean_time = total_times.mean(axis=0)
     ranks = np.argsort(np.argsort(total_times, axis=1), axis=1)
     p_win = (ranks == 0).mean(axis=0)
     p_top3 = (ranks < 3).mean(axis=0)
     out = pd.DataFrame({"Driver": drivers.values, "mean_time_s": mean_time, "p_win": p_win, "p_top3": p_top3}).sort_values("mean_time_s").reset_index(drop=True)
-    return out, pd.DataFrame()
+    return out
 
-# ========================= Auto-fill Entries from FastF1 =========================
-def autofill_entries_from_fastf1(season: int, round_number: int, track_key_fallback: Optional[str] = None) -> Optional[pd.DataFrame]:
-    try:
-        sess = fastf1.get_session(season, round_number if round_number != -1 else (track_key_fallback or ""), "Q")
-        sess.load()
-        res = sess.results
-        if res is None or res.empty:
-            return None
-        df = res.copy()
-        driver_col = "Abbreviation" if "Abbreviation" in df.columns else ("DriverNumber" if "DriverNumber" in df.columns else None)
-        if driver_col is None:
-            return None
-        out = pd.DataFrame()
-        out["Driver"] = df[driver_col].astype(str)
-        if "TeamName" in df.columns:
-            out["Team"] = df["TeamName"].astype(str)
-        elif "Team" in df.columns:
-            out["Team"] = df["Team"].astype(str)
-        else:
-            out["Team"] = ""
+# ---------------- Service ----------------
+def _season_weights(df_feat: pd.DataFrame, base: float = 0.65) -> np.ndarray:
+    if "season" not in df_feat.columns or len(df_feat) == 0:
+        return np.ones(len(df_feat), float)
+    smax = int(df_feat["season"].max())
+    w = np.power(base, (smax - df_feat["season"]).clip(lower=0))
+    return w.values if hasattr(w, "values") else np.asarray(w, dtype=float)
 
-        def _td_to_s(x):
-            try:
-                return x.total_seconds()
-            except Exception:
-                try:
-                    return pd.to_timedelta(x).total_seconds()
-                except Exception:
-                    return np.nan
-
-        qs = []
-        for qcol in ["Q1", "Q2", "Q3"]:
-            if qcol in df.columns:
-                qs.append(df[qcol].apply(_td_to_s))
-        if qs:
-            qmin = pd.concat(qs, axis=1).min(axis=1)
-        else:
-            laps_q = sess.laps.copy()
-            laps_q["LapTime_s"] = laps_q["LapTime"].dt.total_seconds()
-            qmin = laps_q.groupby("Driver")["LapTime_s"].min().reindex(out["Driver"]).values
-        out["QualiTime"] = qmin
-        out = out.dropna(subset=["Driver"]).reset_index(drop=True)
-        return out
-    except Exception:
-        return None
-
-# ========================= Service =========================
 class PodiumService:
     def __init__(self, app_cfg: AppConfig, w_mixed: float = 0.6):
         self.cfg = app_cfg
@@ -551,16 +469,16 @@ class PodiumService:
 
     def _train_dual(self, feat_clean: pd.DataFrame, feat_mixed: pd.DataFrame) -> Dict[str, Any]:
         mA = feat_clean["pace_median_s"].notna()
-        XA = feat_clean.loc[mA].drop(columns=["pace_median_s", "season", "round", "circuit_id", "Driver", "race_id"], errors='ignore')
-        yA = feat_clean.loc[mA, "pace_median_s"]
-        gA = feat_clean.loc[mA, "race_id"].values
-        dA = feat_clean.loc[mA, "Driver"]
+        XA = feat_clean.loc[mA].drop(columns=["pace_median_s","season","round","circuit_id","Driver","race_id"], errors="ignore")
+        yA = feat_clean.loc[mA, "pace_median_s"]; gA = feat_clean.loc[mA, "race_id"].values; dA = feat_clean.loc[mA, "Driver"]
+        wA = _season_weights(feat_clean.loc[mA])
+
         mB = feat_mixed["pace_median_s"].notna()
-        XB = feat_mixed.loc[mB].drop(columns=["pace_median_s", "season", "round", "circuit_id", "Driver", "race_id"], errors='ignore')
-        yB = feat_mixed.loc[mB, "pace_median_s"]
-        gB = feat_mixed.loc[mB, "race_id"].values
-        dB = feat_mixed.loc[mB, "Driver"]
-        return self.dual.fit(XA, yA, gA, dA, XB, yB, gB, dB)
+        XB = feat_mixed.loc[mB].drop(columns=["pace_median_s","season","round","circuit_id","Driver","race_id"], errors="ignore")
+        yB = feat_mixed.loc[mB, "pace_median_s"]; gB = feat_mixed.loc[mB, "race_id"].values; dB = feat_mixed.loc[mB, "Driver"]
+        wB = _season_weights(feat_mixed.loc[mB])
+
+        return self.dual.fit(XA, yA, gA, dA, wA, XB, yB, gB, dB, wB)
 
     def predict_podium(self, gp_track_key: str, date: str,
                        seasons_for_training: Tuple[int, ...] = (2022, 2023, 2024),
@@ -570,28 +488,22 @@ class PodiumService:
                        weather: Optional[Dict[str, float]] = None,
                        entries: Optional[pd.DataFrame] = None) -> pd.DataFrame:
 
-        # Load + Clean
+        # 1) Load & features
         laps_all = load_sessions(gp_track_key, seasons_for_training)
         if laps_all.empty:
             raise ValueError("No sessions loaded. Check track key/seasons.")
         laps_clean = clean_laps(laps_all, mode="clean")
         laps_mixed = clean_laps(laps_all, mode="mixed")
-
-        # Features
         drA = build_driver_race_table(laps_clean)
         drB = build_driver_race_table(laps_mixed)
         featA = add_quali_features(drA, laps_clean)
         featB = add_quali_features(drB, laps_mixed)
-        featA = add_practice_features(featA, laps_clean)
-        featB = add_practice_features(featB, laps_mixed)
         if weather is not None:
             for k, v in weather.items():
-                featA[k] = v
-                featB[k] = v
-        featA = finalize_features(featA)
-        featB = finalize_features(featB)
+                featA[k] = v; featB[k] = v
+        featA = finalize_features(featA); featB = finalize_features(featB)
 
-        # Target race = latest season/round for this GP
+        # 2) pick latest past race at this GP
         maskA_all = featA["circuit_id"].astype(str).str.contains(gp_track_key, case=False, na=False)
         if not maskA_all.any():
             raise ValueError("No historical rows for target GP. Try adding more seasons.")
@@ -601,74 +513,87 @@ class PodiumService:
         infA = featA[(featA["season"] == latest_season) & (featA["round"] == latest_round)].copy()
         infB = featB[(featB["season"] == latest_season) & (featB["round"] == latest_round)].copy()
         if len(infA) == 0 or len(infB) == 0:
-            raise ValueError("No inference rows for latest target race (missing FP/Q/R).")
+            raise ValueError("No inference rows for latest target race (missing Q/R).")
 
-        # Entries override
-        if entries is not None and len(entries) > 0:
-            ent = entries.copy()
-            ent.columns = [c.strip() for c in ent.columns]
-            colmap = {c.lower(): c for c in ent.columns}
-            if "driver" not in colmap:
-                raise ValueError("Entries must include a 'Driver' column")
-            ent.rename(columns={colmap["driver"]: "Driver"}, inplace=True)
-            if "team" in colmap: ent.rename(columns={colmap["team"]: "Team"}, inplace=True)
-            if "qualitime (s)" in colmap: ent.rename(columns={colmap["qualitime (s)"]: "QualiTime"}, inplace=True)
-            if "qualitime" in colmap and "QualiTime" not in ent.columns:
-                ent.rename(columns={colmap["qualitime"]: "QualiTime"}, inplace=True)
-            ent = ent[[c for c in ["Driver","Team","QualiTime"] if c in ent.columns]]
+        # 2a) entries/quali override required — force current signals
+        if entries is None or entries.empty:
+            rnd = _find_round_in_schedule(latest_season, gp_track_key)
+            auto = autofill_entries_from_fastf1(latest_season, rnd if rnd != -1 else gp_track_key, gp_track_key)
+            if auto is None or auto.empty:
+                raise ValueError("No entries/quali available. Paste CSV in sidebar or try another season.")
+            entries = auto
 
-            listed = set(ent["Driver"].astype(str).unique())
-            infA = infA[infA["Driver"].astype(str).isin(listed)].copy()
-            infB = infB[infB["Driver"].astype(str).isin(listed)].copy()
-            if len(infA) == 0:
-                raise ValueError("None of the provided drivers match the target race. Check driver codes (e.g., VER, NOR).")
+        # normalize entries columns
+        e = entries.copy()
+        e.columns = [c.strip() for c in e.columns]
+        # standardize names
+        ren = {}
+        for c in e.columns:
+            lc = c.lower()
+            if lc in ("driver", "code"): ren[c] = "Driver"
+            if "qual" in lc and "time" in lc: ren[c] = "QualiTime"
+            if lc == "team": ren[c] = "Team"
+        e.rename(columns=ren, inplace=True)
+        if "Driver" not in e.columns:
+            raise ValueError("Entries must include a 'Driver' column.")
+        if "QualiTime" in e.columns:
+            # accept seconds or mm:ss.sss
+            def _to_seconds(x):
+                try:
+                    return float(x)
+                except Exception:
+                    s = str(x).strip()
+                    if ":" in s:
+                        mm, ss = s.split(":", 1)
+                        return float(mm) * 60 + float(ss)
+                    return np.nan
+            e["best_q_s"] = e["QualiTime"].apply(_to_seconds)
+        # build gap_to_pole from entries
+        if "best_q_s" in e.columns and e["best_q_s"].notna().any():
+            pole = float(np.nanmin(e["best_q_s"].values))
+            e["gap_to_pole_s"] = e["best_q_s"] - pole
 
-            if "QualiTime" in ent.columns and ent["QualiTime"].notna().any():
-                def _to_seconds(x):
-                    try:
-                        return float(x)
-                    except Exception:
-                        s = str(x).strip()
-                        if ":" in s:
-                            mm, ss = s.split(":", 1)
-                            return float(mm) * 60 + float(ss)
-                        return np.nan
-                ent["best_q_s"] = ent["QualiTime"].apply(_to_seconds)
-                if ent["best_q_s"].notna().any():
-                    pole = float(np.nanmin(ent["best_q_s"].values))
-                    ent["gap_to_pole_s"] = ent["best_q_s"] - pole
-                    for tag in ("A","B"):
-                        df = infA if tag=="A" else infB
-                        df = df.drop(columns=["best_q_s","gap_to_pole_s"], errors="ignore")
-                        df = df.merge(ent[["Driver","best_q_s","gap_to_pole_s"]], on="Driver", how="left")
-                        if tag=="A": infA = df
-                        else: infB = df
+        # filter inference rows to provided drivers
+        listed = set(e["Driver"].unique())
+        infA = infA[infA["Driver"].isin(listed)].copy()
+        infB = infB[infB["Driver"].isin(listed)].copy()
+        if len(infA) == 0:
+            raise ValueError("Provided drivers do not match FastF1 driver codes for this GP.")
 
-        XA = infA.drop(columns=["pace_median_s", "season", "round", "circuit_id", "Driver", "race_id"], errors='ignore')
-        XB = infB.drop(columns=["pace_median_s", "season", "round", "circuit_id", "Driver", "race_id"], errors='ignore')
-        drivers = infA["Driver"].reset_index(drop=True)
+        # apply override
+        for df in (infA, infB):
+            df.drop(columns=["best_q_s","gap_to_pole_s"], errors="ignore", inplace=True)
+            df.merge(e[["Driver","best_q_s","gap_to_pole_s"]], on="Driver", how="left", copy=False)
 
-        # Train on everything EXCEPT the target race (no leakage)
+        # 3) train on all other races (no leakage)
         trA = featA[~((featA["season"] == latest_season) & (featA["round"] == latest_round))]
         trB = featB[~((featB["season"] == latest_season) & (featB["round"] == latest_round))]
         _ = self._train_dual(trA, trB)
 
-        if len(XA) == 0 or len(XB) == 0:
-            raise ValueError("No inference rows for target GP.")
+        # 4) predict + MC
+        XA = infA.drop(columns=["pace_median_s","season","round","circuit_id","Driver","race_id"], errors="ignore")
+        XB = infB.drop(columns=["pace_median_s","season","round","circuit_id","Driver","race_id"], errors="ignore")
+        drivers = infA["Driver"].reset_index(drop=True)
+
         q_blend = self.dual.predict_quantiles_blended(XA, XB)
         base_pace = q_blend.get(0.5, self.dual.predict_blended(XA, XB))
         sigma = self.dual.sigma_combined(drivers, q_blend)
-        ranking, _ = monte_carlo_podium(drivers, base_pace, sigma, laps, pit_loss_s, pit_count_mean, sc_rate, team_order_prob,
-                                        n_runs=self.cfg.sim.n_runs, seed=self.cfg.sim.rng_seed)
+
+        ranking = monte_carlo_podium(
+            drivers, base_pace, sigma,
+            laps, pit_loss_s, pit_count_mean, sc_rate, team_order_prob,
+            n_runs=self.cfg.sim.n_runs, seed=self.cfg.sim.rng_seed
+        )
         return ranking
 
-# ========================= UI — Sidebar Controls =========================
+# ---------------- Sidebar ----------------
 st.sidebar.header("Settings")
 
-KNOWN_GPS = sorted(list(TRACK_COORDS.keys()) + [
-    "Australia", "Spain", "Canada", "Austria", "Hungary", "Belgium",
+KNOWN_GPS = sorted(list(set(list(TRACK_COORDS.keys()) + [
+    "Australia", "Saudi Arabia", "Bahrain", "Japan", "China", "Miami",
+    "Imola", "Monaco", "Spain", "Canada", "Austria", "Hungary", "Belgium",
     "Netherlands", "Singapore", "USA", "Mexico", "Brazil", "Abu Dhabi"
-])
+])))
 
 gp_mode = st.sidebar.radio("GP input mode", ["Pick from list", "Free text"], horizontal=True)
 if gp_mode == "Pick from list":
@@ -676,11 +601,11 @@ if gp_mode == "Pick from list":
 else:
     gp = st.sidebar.text_input("GP (track key)", value="Monaco")
 
-col1, col2 = st.sidebar.columns(2)
-with col1:
+c1, c2 = st.sidebar.columns(2)
+with c1:
     date = st.text_input("Date (YYYY-MM-DD)", value="2025-05-25")
-with col2:
-    season_choices = list(range(2018, dt.date.today().year+1))
+with c2:
+    season_choices = list(range(2018, _parse_date(date).year + 1))
     default_seasons = [2022, 2023, 2024]
 seasons_selected = st.sidebar.multiselect("Training seasons", options=season_choices, default=default_seasons)
 seasons_tuple = tuple(sorted(set(int(s) for s in seasons_selected)))
@@ -689,29 +614,28 @@ if len(seasons_tuple) < 2:
 
 with st.sidebar.expander("Advanced settings", expanded=False):
     st.markdown("**Race Params**")
-    laps = st.number_input("Laps", min_value=1, max_value=1000, value=60, key="laps")
-    pit_loss_s = st.number_input("Pit loss (s)", min_value=0.0, max_value=60.0, value=22.0, step=0.5, key="pitloss")
-    pit_count_mean = st.number_input("Mean pit stops", min_value=0.0, max_value=6.0, value=2.0, step=0.1, key="pitmean")
+    laps = st.number_input("Laps", 1, 1000, 60, key="laps")
+    pit_loss_s = st.number_input("Pit loss (s)", 0.0, 60.0, 22.0, 0.5, key="pitloss")
+    pit_count_mean = st.number_input("Mean pit stops", 0.0, 6.0, 2.0, 0.1, key="pitmean")
     sc_rate = st.slider("Safety Car probability", 0.0, 1.0, 0.35, 0.01, key="sc")
     team_order_prob = st.slider("Team-order probability", 0.0, 1.0, 0.10, 0.01, key="teamorder")
 
     st.markdown("**Model / Simulation**")
     w_mixed = st.slider("Blend weight (mixed laps)", 0.0, 1.0, 0.6, 0.05, key="wmixed")
-    n_runs = st.number_input("Monte Carlo runs", min_value=100, max_value=10000, value=1500, step=100, key="nruns")
-    rng_seed = st.number_input("Random seed", min_value=0, max_value=10_000_000, value=42, step=1, key="seed")
+    n_runs = st.number_input("Monte Carlo runs", 100, 10000, 1500, 100, key="nruns")
+    rng_seed = st.number_input("Random seed", 0, 10_000_000, 42, 1, key="seed")
 
     st.markdown("**Weather**")
     wx_mode = st.selectbox("Weather source", ["None", "Forecast (Open-Meteo)", "Past 3 days avg (Open-Meteo)"], key="wxmode")
     lat_in = st.text_input("Latitude (optional)", value="", key="lat")
     lon_in = st.text_input("Longitude (optional)", value="", key="lon")
 
-# Entries / Quali 입력
 with st.sidebar.expander("Entries / Qualifying (optional)", expanded=False):
-    mode_ent = st.radio("Provide entries?", ["None", "Paste CSV", "Upload CSV"], horizontal=True)
+    mode_ent = st.radio("How to provide entries?", ["Auto-fill from FastF1", "Paste CSV", "Upload CSV"], horizontal=False)
     entries_df = None
+    sample = "Driver,Team,QualiTime\nVER,Red Bull,86.204\nNOR,McLaren,86.269\nPIA,McLaren,86.375\n"
     if mode_ent == "Paste CSV":
-        sample = "Driver,Team,QualiTime\nVER,Red Bull,86.204\nNOR,McLaren,86.269\nPIA,McLaren,86.375\n"
-        txt = st.text_area("Paste CSV here", value=sample, height=160)
+        txt = st.text_area("Paste CSV here", value=sample, height=140)
         if txt.strip():
             try:
                 entries_df = pd.read_csv(io.StringIO(txt))
@@ -727,15 +651,10 @@ with st.sidebar.expander("Entries / Qualifying (optional)", expanded=False):
             except Exception as e:
                 st.warning(f"CSV parse failed: {e}")
 
-# Auto-fill
-with st.sidebar.expander("Auto-fill (FastF1)", expanded=False):
-    use_autofill = st.checkbox("Use FastF1 qualifying entries (past races only)", value=False)
-
-# Cache tools
-colc1, colc2 = st.sidebar.columns([1,1])
-with colc1:
+col_btn1, col_btn2 = st.sidebar.columns([1,1])
+with col_btn1:
     run_btn = st.button("Predict podium", type="primary")
-with colc2:
+with col_btn2:
     if st.button("Clear FastF1 cache"):
         import shutil
         try:
@@ -745,10 +664,10 @@ with colc2:
         except Exception as e:
             st.sidebar.warning(f"Cache clear failed: {e}")
 
-# ========================= Run & Display =========================
+# ---------------- Run ----------------
 if run_btn:
     with st.status("Preparing…", expanded=False) as status:
-        status.update(label="Loading sessions", state="running")
+        status.update(label="Loading & training", state="running")
         try:
             APP_CONFIG.sim.n_runs = int(n_runs)
             APP_CONFIG.sim.rng_seed = int(rng_seed)
@@ -771,21 +690,22 @@ if run_btn:
                         wx = fetch_weather_open_meteo(la, lo, date, mode=mode_flag)
                     except Exception as we:
                         st.warning(f"Weather fetch failed: {we}")
-                        wx = None
 
-            # Auto-fill entries if requested (uses latest selected season)
-            if use_autofill and (seasons_tuple):
+            # Auto-fill entries if selected
+            ents = entries_df
+            if mode_ent == "Auto-fill from FastF1":
+                # use latest selected season's found round
                 try:
-                    latest_season_candidate = max(seasons_tuple)
-                    rnd = _find_round_in_schedule(latest_season_candidate, gp)
-                    auto_df = autofill_entries_from_fastf1(latest_season_candidate, rnd, track_key_fallback=gp)
+                    season_latest = max(seasons_tuple) if seasons_tuple else _parse_date(date).year
+                    rnd = _find_round_in_schedule(season_latest, gp)
+                    auto_df = autofill_entries_from_fastf1(season_latest, rnd if rnd != -1 else gp, gp)
                     if auto_df is not None and not auto_df.empty:
-                        entries_df = auto_df
-                        st.sidebar.success(f"Auto-filled {len(entries_df)} entries from FastF1")
+                        ents = auto_df
+                        st.sidebar.success(f"Auto-filled {len(auto_df)} entries from FastF1")
                     else:
-                        st.sidebar.warning("Could not auto-fill entries from FastF1 for this GP/season.")
+                        st.sidebar.warning("Auto-fill failed; please paste/upload CSV.")
                 except Exception:
-                    st.sidebar.warning("Auto-fill failed.")
+                    st.sidebar.warning("Auto-fill error; please paste/upload CSV.")
 
             ranking = svc.predict_podium(
                 gp_track_key=gp,
@@ -797,22 +717,20 @@ if run_btn:
                 sc_rate=float(st.session_state.get("sc", 0.35)),
                 team_order_prob=float(st.session_state.get("teamorder", 0.10)),
                 weather=wx,
-                entries=entries_df,
+                entries=ents
             )
             status.update(label="Done", state="complete")
         except Exception as e:
             status.update(label="Failed", state="error")
-            st.error(f"Error: {e}")
+            tb = traceback.format_exc()
+            st.error("Error:\n" + textwrap.dedent(tb))
             st.stop()
 
-    # Weather summary
     if st.session_state.get("wxmode", "None") != "None" and wx is not None:
         st.subheader("Weather (used in features)")
-        cwx1, cwx2 = st.columns(2)
-        with cwx1:
-            st.metric("Temperature", f"{wx['temp_c']:.1f} °C")
-        with cwx2:
-            st.metric("Rain probability", f"{wx['rain_prob']*100:.0f}%")
+        cw1, cw2 = st.columns(2)
+        with cw1: st.metric("Temperature", f"{wx['temp_c']:.1f} °C")
+        with cw2: st.metric("Rain probability", f"{wx['rain_prob']*100:.0f}%")
 
     st.subheader("Predicted Ranking")
     fmt = ranking.copy()
@@ -842,6 +760,6 @@ if run_btn:
     st.subheader("Win probability")
     st.bar_chart(ranking.set_index("Driver")["p_win"])
 
-    st.caption("Note: Track meta CSV not attached yet — pit/SC params are user-specified. Weather uses Open-Meteo; uncertainty from quantiles + OOF residuals.")
+    st.caption("Note: Entries/Quali are auto-filled from FastF1 by default. You can paste/upload to override. Weather via Open-Meteo.")
 else:
-    st.info("👈 사이드바에서 GP와 파라미터를 설정하고 **Predict podium**을 눌러주세요.")
+    st.info("👈 사이드바에서 GP, 시즌, 옵션을 설정하고 **Predict podium**을 눌러주세요.")
